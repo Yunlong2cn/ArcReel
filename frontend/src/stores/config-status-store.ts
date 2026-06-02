@@ -87,29 +87,60 @@ interface ConfigStatusState {
   isComplete: boolean;
   loading: boolean;
   initialized: boolean;
+  /** 进行中刷新期间又收到 refresh() 时置位,本轮完成后补跑一次,避免丢掉最后一次请求的数据。 */
+  pendingRefresh: boolean;
   fetch: () => Promise<void>;
   refresh: () => Promise<void>;
 }
 
-export const useConfigStatusStore = create<ConfigStatusState>((set, get) => ({
-  issues: [],
-  isComplete: true,
-  loading: false,
-  initialized: false,
+export const useConfigStatusStore = create<ConfigStatusState>((set, get) => {
+  // 单条在途刷新链:并发 refresh()/fetch() 都复用它,
+  // 返回的 Promise 只在数据(含补跑)真正落地后才 resolve——await 完即代表状态最新。
+  let inflight: Promise<void> | null = null;
 
-  fetch: async () => {
-    if (get().initialized || get().loading) return;
-    await get().refresh();
-  },
-
-  refresh: async () => {
-    if (get().loading) return;
-    set({ loading: true });
-    try {
-      const issues = await getConfigIssues();
-      set({ issues, isComplete: issues.length === 0, loading: false, initialized: true });
-    } catch {
-      set({ loading: false });
+  const run = async (): Promise<void> => {
+    // 循环直到没有新的 pending:补跑在同一条链上完成,而非提前 resolve。
+    for (;;) {
+      set({ loading: true, pendingRefresh: false });
+      try {
+        const issues = await getConfigIssues();
+        set({ issues, isComplete: issues.length === 0, initialized: true });
+      } catch {
+        // 失败保持 initialized=false,下次仍可重试。
+      }
+      // loading 仅在整条链终止时才置 false:补跑间隙保持 true,避免 true→false→true 闪烁。
+      if (!get().pendingRefresh) {
+        set({ loading: false });
+        break;
+      }
     }
-  },
-}));
+  };
+
+  return {
+    issues: [],
+    isComplete: true,
+    loading: false,
+    initialized: false,
+    pendingRefresh: false,
+
+    fetch: async () => {
+      if (get().initialized) return;
+      // 已有刷新在途:等它,而不是另起一轮;无在途则发起一次。
+      await (inflight ?? get().refresh());
+    },
+
+    refresh: () => {
+      // 已有刷新在途:标记补跑并复用同一条完成链,所有并发调用方都 await 到最终落地。
+      // 否则"保存供应商后的 refresh()"会被进行中的初始加载/前一次刷新静默吞掉,
+      // 红点/警示停留在保存前的旧值。
+      if (inflight) {
+        set({ pendingRefresh: true });
+        return inflight;
+      }
+      inflight = run().finally(() => {
+        inflight = null;
+      });
+      return inflight;
+    },
+  };
+});
